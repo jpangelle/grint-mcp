@@ -1,0 +1,33 @@
+# Fly.io config for the remote (HTTP) mode. App names are global on Fly:
+# if this one is taken, change it here (app + PUBLIC_URL).
+app = "grint-mcp-jpangelle"
+primary_region = "dfw"
+
+[env]
+  PUBLIC_URL = "https://grint-mcp-jpangelle.fly.dev"
+  DATA_DIR = "/data"
+  PORT = "8080"
+
+# auth.db (sign-ins) and one SQLite cache per user live on this volume.
+[[mounts]]
+  source = "grint_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Sleep when idle, wake on the next request (keeps cost near zero).
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

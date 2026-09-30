@@ -1,0 +1,28 @@
+{
+  "name": "grint-mcp",
+  "version": "1.0.0",
+  "description": "Unofficial MCP server for TheGrint golf app: sync your rounds locally and query them with SQL",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --no-warnings src/index.js",
+    "login": "node --no-warnings src/cli.js login",
+    "sync": "node --no-warnings src/cli.js sync",
+    "sync:full": "node --no-warnings src/cli.js sync --full",
+    "test": "node --no-warnings test/offline-test.js && node --no-warnings test/mcp-smoke.js && node --no-warnings test/http-oauth-test.js",
+    "install-claude": "node src/install-claude.js",
+    "start:http": "node --no-warnings src/http.js"
+  },
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "cheerio": "^1.2.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "zod": "^4.6.5"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  }
+}
