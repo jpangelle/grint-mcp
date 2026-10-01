@@ -26,9 +26,15 @@ export class AuthError extends Error {}
 export class GrintClient {
   // Either { username, password } (logs in with the form) or { rememberToken }
   // (TheGrint's 90-day "remember me" cookie, which restores a session by itself).
-  constructor({ username, password, rememberToken } = {}) {
+  //
+  // `remember` asks TheGrint for a new remember token on password login. TheGrint
+  // keeps only one per account and a new one kills the old, so only the hosted
+  // sign-in (which stores the token) sets it. Local mode re-logs in with the
+  // password instead, which leaves the hosted connector's token alone.
+  constructor({ username, password, rememberToken, remember = false } = {}) {
     this.username = username;
     this.password = password;
+    this.remember = remember;
     this.rememberToken = rememberToken ?? null;
     this.rememberExpiresAt = null; // epoch seconds, known only after a password login
     this.cookies = new Map();
@@ -95,7 +101,7 @@ export class GrintClient {
           password: this.password,
           redirect: "",
           "submit-form-login": "Log In",
-          remember: "on",
+          ...(this.remember ? { remember: "on" } : {}),
         },
       });
       if (isLoggedOutUrl(url)) throw new AuthError("TheGrint login failed. Check your username and password.");

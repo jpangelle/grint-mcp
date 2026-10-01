@@ -8,7 +8,7 @@
     "login": "node --no-warnings src/cli.js login",
     "sync": "node --no-warnings src/cli.js sync",
     "sync:full": "node --no-warnings src/cli.js sync --full",
-    "test": "node --no-warnings test/offline-test.js && node --no-warnings test/mcp-smoke.js && node --no-warnings test/http-oauth-test.js",
+    "test": "node --no-warnings test/offline-test.js && node --no-warnings test/remember-test.js && node --no-warnings test/mcp-smoke.js && node --no-warnings test/http-oauth-test.js",
     "install-claude": "node src/install-claude.js",
     "start:http": "node --no-warnings src/http.js"
   },

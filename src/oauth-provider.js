@@ -84,7 +84,7 @@ export class GrintOAuthProvider {
 
     if (!username || !password) return again(400, "Enter your TheGrint username and password.");
 
-    const grint = new GrintClient({ username, password });
+    const grint = new GrintClient({ username, password, remember: true });
     try {
       await grint.login();
     } catch (e) {
