@@ -173,6 +173,44 @@ export class GrintClient {
     return [...new Map(rounds.map((r) => [r.id, r])).values()];
   }
 
+  // A friend's rounds (or anyone's whose scores you can see), newest first.
+  // The first page of /score only ever shows your own rounds, so friends are
+  // paged entirely through listMoreScores starting at offset 0.
+  // `maxPages` stops early, e.g. when only today's rounds are needed.
+  async listRoundsFor(userId, { maxPages = 500, knownIds = null } = {}) {
+    if (!this.loggedIn) await this.login();
+    if (String(userId) === String(this.userId) && maxPages >= 500) return this.listAllRounds();
+    const rounds = [];
+    let offset = 0;
+    for (let wave = 1; wave <= maxPages; wave++) {
+      const html = await this.request("/score/listMoreScores", {
+        method: "POST",
+        form: {
+          wave,
+          wave18: offset,
+          wave9: offset,
+          userId,
+          courseId: "",
+          typeScore: 0,
+          handicap_company_id: this.handicapCompanyId,
+        },
+      });
+      const page = parseScoreRows(`<table><tbody>${html}</tbody></table>`);
+      if (!page.length) break;
+      rounds.push(...page);
+      offset += page.length;
+      // Incremental: once a whole page is already cached, older pages are too.
+      if (knownIds && page.every((r) => knownIds.has(r.id))) break;
+    }
+    return [...new Map(rounds.map((r) => [r.id, r])).values()];
+  }
+
+  // The "Live Scores" list the dashboard renders for friends playing right now.
+  // Returns the list's text and any score ids it links to. Empty when nobody is live.
+  async getLiveScoresList() {
+    return parseLiveScores(await this.request("/dashboard"));
+  }
+
   // Hole-by-hole data for one round, from its scorecard page.
   async getScorecard(round) {
     const path = `/score/edit_score/${round.id}${round.nine ? `/${round.nine}` : ""}?handicap_company_id=${this.handicapCompanyId}`;
@@ -253,6 +291,28 @@ export function parseRankingGolfers(html) {
   const hcps = [...html.matchAll(/var hcpOrhcpGhap = \(provider==7\)\?'[^']*':'([^']*)'/g)].map((m) => num(m[1]));
   golfers.forEach((g, i) => (g.handicap = hcps[i] ?? null));
   return golfers;
+}
+
+// Pulls the server-rendered #ListliveScores block out of the dashboard.
+export function parseLiveScores(html) {
+  const $ = cheerio.load(html);
+  const box = $("#ListliveScores");
+  const text = box.text().replace(/\s+/g, " ").trim();
+  const scores = [];
+  box.find("a[href]").each((_, a) => {
+    const m = $(a).attr("href").match(/(?:edit_score|review_score)\/(\d+)(?:\/(\d+))?/);
+    if (m) scores.push({ id: m[1], nine: m[2] ?? null });
+  });
+  const profiles = [];
+  box.find('a[href*="/profile/index/"]').each((_, a) => {
+    profiles.push({ userId: $(a).attr("href").match(/profile\/index\/(\d+)/)?.[1], name: $(a).text().trim() || null });
+  });
+  return {
+    found: box.length > 0,
+    text: text.slice(0, 4000),
+    scores: [...new Map(scores.map((s) => [s.id, s])).values()],
+    profiles,
+  };
 }
 
 // Parses <tr> rows from the "My Scores" table.

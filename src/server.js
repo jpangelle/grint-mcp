@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { SCHEMA_SQL, VIEWS_SQL } from "./db.js";
-import { syncRounds } from "./sync.js";
+import { syncRounds, courseDataFor } from "./sync.js";
 
 const MAX_ROWS = 500;
 const AUTO_SYNC_HOURS = Number(process.env.GRINT_AUTO_SYNC_HOURS ?? 6);
@@ -68,6 +68,8 @@ Use them whenever the user asks about their own golf game, even if they don't me
 - putting (putts per round, 3-putts), greens in regulation (GIR), fairways hit and miss direction, penalties, water, OB, sand
 - trends and comparisons: this year vs last, month by month, front nine vs back nine, one course vs another
 - strategy or practice advice based on how they have actually played
+They also hold the rounds of the user's TheGrint friends (golfer_name / is_me columns), so they can compare against or answer questions about friends.
+During a round in progress (for example a skins game), use get_live_scores to read today's hole-by-hole scores straight from TheGrint.
 Start with grint_overview to get exact course names, then answer with query_grint_data.`;
 
 // Each transport (stdio, or one per HTTP request) gets its own McpServer.
@@ -141,6 +143,7 @@ Tips:
 - Pars on a hole: result = 'par' (or score_to_par = 0). Par or better: score_to_par <= 0.
 - Fairways hit: fairway_hit, usually filtered to par > 3. GIR/putts are NULL for rounds where putts weren't tracked, so exclude NULLs in averages.
 - Use practice = 0 to exclude practice rounds when that matters.
+- Rounds include friends'. Filter is_me = 1 for the user's own game; use golfer_name LIKE '%stokes%' for a friend.
 
 Example: "how many times have I parred hole 3 at Jimmy Clay"
   SELECT COUNT(*) FROM hole_details WHERE course_name LIKE '%jimmy clay%' AND hole = 3 AND result = 'par';`,
@@ -158,6 +161,94 @@ Example: "how many times have I parred hole 3 at Jimmy Clay"
         return text(out);
       } catch (e) {
         return fail(`SQL error: ${e.message}`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_live_scores",
+    {
+      title: "Today's scores, hole by hole",
+      description:
+        "Fetch scores straight from TheGrint (not the cache) for rounds dated today: yours plus any friends you name, " +
+        "and anything in TheGrint's Live Scores list. Returns each golfer's strokes per hole with par and stroke index. " +
+        "Use it during a round (for example a skins game) to pick up new holes without the user typing scores. " +
+        "Holes not yet entered are left out. If a golfer has no round dated today, they are listed in not_found.",
+      inputSchema: {
+        players: z
+          .array(z.string())
+          .optional()
+          .describe("Friends to include, by full or partial name as on TheGrint (e.g. 'Stokes', 'Eric Anderson'). You are always included."),
+        date: z.string().optional().describe("YYYY-MM-DD. Defaults to today in `timezone`."),
+        timezone: z.string().optional().describe("IANA time zone for 'today'. Defaults to America/Chicago."),
+      },
+    },
+    async ({ players = [], date, timezone = "America/Chicago" }) => {
+      try {
+        const day = date ?? new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(new Date());
+        const client = (ctx.client ??= ctx.createClient());
+        if (!client.loggedIn) await client.login();
+        const { db } = ctx.cache;
+        ctx.cache.ensureMe(client.userId);
+        if (!db.prepare("SELECT 1 FROM golfers WHERE is_me = 0 LIMIT 1").get()) ctx.cache.saveGolfers(await client.listFriends());
+
+        const wanted = new Map([[String(client.userId), "me"]]);
+        const unmatched = [];
+        const ambiguous = [];
+        for (const p of players) {
+          const hits = db
+            .prepare("SELECT id, name FROM golfers WHERE is_me = 0 AND name LIKE ? ORDER BY updated_at IS NULL")
+            .all(`%${p.trim()}%`);
+          if (!hits.length) unmatched.push(p);
+          else if (hits.length > 1 && !hits.some((h) => h.name.toLowerCase() === p.trim().toLowerCase()))
+            ambiguous.push({ query: p, matches: hits.map((h) => h.name) });
+          else wanted.set(hits.find((h) => h.name.toLowerCase() === p.trim().toLowerCase())?.id ?? hits[0].id, p);
+        }
+
+        const live = await client.getLiveScoresList();
+        const toFetch = new Map(live.scores.map((s) => [s.id, s]));
+        const notFound = [];
+        await Promise.all(
+          [...wanted.keys()].map(async (gid) => {
+            const rounds = await client.listRoundsFor(gid, { maxPages: 1 });
+            const today = rounds.filter((r) => r.date === day);
+            if (!today.length) notFound.push(gid);
+            for (const r of today) toFetch.set(r.id, r);
+          }),
+        );
+
+        const nameOf = (id) => db.prepare("SELECT name FROM golfers WHERE id = ?").get(id)?.name ?? null;
+        const results = [];
+        for (const r of toFetch.values()) {
+          const card = await client.getScorecard(r);
+          const course = card.courseId && card.tee
+            ? await courseDataFor(client, db, { courseId: card.courseId, tee: card.tee, roundType: card.roundType, scoreId: r.id }).catch(() => null)
+            : null;
+          const holes = card.holes
+            .filter((h) => h.strokes !== null)
+            .map((h) => ({ hole: h.hole, strokes: h.strokes, par: course?.par[h.hole - 1] ?? null, hcp_index: course?.hcpIndex[h.hole - 1] ?? null }));
+          results.push({
+            golfer: nameOf(card.ownerId) ?? card.ownerId,
+            golfer_id: card.ownerId,
+            round_id: r.id,
+            date: card.date,
+            course: card.courseName,
+            tee: card.tee,
+            holes_entered: holes.length,
+            last_hole: holes.at(-1)?.hole ?? null,
+            holes,
+          });
+        }
+        return text({
+          date: day,
+          rounds: results,
+          not_found: notFound.map((id) => nameOf(id) ?? id),
+          unmatched_names: unmatched,
+          ambiguous_names: ambiguous,
+          live_scores_list: live.text ? live : "empty (nobody shown as live on TheGrint's dashboard)",
+        });
+      } catch (e) {
+        return fail(`Could not fetch live scores: ${e.message}`);
       }
     },
   );

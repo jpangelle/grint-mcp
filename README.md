@@ -71,9 +71,14 @@ Each user's first sign-in imports their rounds in the background (a couple of mi
 | --- | --- |
 | `grint_overview` | Round count, date range, last sync, and every course with exact names/tees. Helps Claude map "jimmy clay" to the stored course name. |
 | `query_grint_data` | Runs a read-only SQL query against the cache. The full schema is in the tool description, so Claude writes the SQL itself. |
-| `sync_grint_data` | Pulls new/changed rounds (or `full_refresh`). Runs ~45s per call and reports `remaining` if there's more. |
+| `sync_grint_data` | Pulls new/changed rounds (or `full_refresh`), yours first, then your friends'. Runs ~45s per call and reports `remaining` if there's more. |
+| `get_live_scores` | Reads today's rounds straight from TheGrint (yours plus friends you name, plus the dashboard's Live Scores list) with strokes, par and stroke index per hole. Meant for in-round use, e.g. a skins game. |
 
 Queries sync on their own when the data is more than 6 hours old (`GRINT_AUTO_SYNC_HOURS` to change, `0` to disable).
+
+## Friends
+
+Sync also imports rounds from your TheGrint friends (Mutual Following, from the Ranking page). Friends who hide their stats are skipped. The friends list refreshes once a day; set `GRINT_SYNC_FRIENDS=0` to turn this off. Use the `is_me` and `golfer_name` columns on `round_details` / `hole_details` to tell rounds apart.
 
 ## Data model
 

@@ -69,12 +69,24 @@ const pages = {
   }),
 };
 
+pages["/ranking"] = `<script>allstats.push({ user_id: '1000001', name: 'Me', isme:1, scr: '85.0', is_visible:'1' });
+var hcpOrhcpGhap = (provider==7)?'13.0':'13.0';
+allstats.push({ user_id: '2000002', name: 'Sam Stokes', isme:0, scr: '88.4', is_visible:'1' });
+var hcpOrhcpGhap = (provider==7)?'14.1':'14.1';</script>`;
+const friendRow = row("08/26/26", "The Jimmy Clay Golf Course", "Blue 71.10 | 129", "88", 18, "60000001");
+pages["/score/edit_score/60000001?handicap_company_id=3"] = card({
+  round: "18", tee: "Blue", date: "2026-08-26",
+  strokes: [5, 4, 5, 6, 4, 4, 6, 5, 5, 5, 5, 3, 5, 4, 4, 6, 5, 7],
+  putts: Array(18).fill(2),
+}).replace("<form>", '<form><input type="hidden" name="userid1" value="2000002">');
+let friendWave = 0;
 let wave = 0;
 GrintClient.prototype.login = async function () {
   this.userId = "1000001";
   this.loggedIn = true;
 };
 GrintClient.prototype.request = async function (p, opts = {}) {
+  if (p === "/score/listMoreScores" && opts.form?.userId === "2000002") return friendWave++ === 0 ? friendRow : "";
   if (p === "/score/listMoreScores") return wave++ === 0 ? moreScores : "\n<script>/* empty page */</script>";
   if (p === "/ajax/get_course_data/0/0/0") return courseData;
   if (!(p in pages)) throw new Error(`unexpected request ${p}`);
@@ -92,7 +104,8 @@ assert.equal(parseScoreRows(`<table><tbody>${moreScores}</tbody></table>`)[0].ni
 
 // --- full sync
 const result = await syncRounds();
-assert.equal(result.synced, 3, JSON.stringify(result));
+assert.equal(result.synced, 4, JSON.stringify(result));
+assert.equal(result.friendRoundsSynced, 1);
 assert.equal(result.remaining, 0);
 
 const q = (sql) => getReadOnlyDb().prepare(sql).all();
@@ -113,12 +126,24 @@ assert.equal(noPutts, 0);
 const b9 = q(`SELECT round_type, holes_played, par, (SELECT MIN(hole) FROM holes WHERE round_id = r.id) first_hole FROM rounds r WHERE id = '50000003'`)[0];
 assert.deepEqual({ ...b9 }, { round_type: "B9", holes_played: 9, par: 36, first_hole: 10 });
 
+const fr = q(`SELECT golfer_name, is_me, score FROM round_details WHERE id = '60000001'`)[0];
+assert.deepEqual({ ...fr }, { golfer_name: "Sam Stokes", is_me: 0, score: 88 });
+assert.equal(q(`SELECT COUNT(*) n FROM round_details WHERE is_me = 1`)[0].n, 3);
+
 // Read-only connection must reject writes.
 assert.throws(() => getReadOnlyDb().prepare("DELETE FROM rounds").run());
 
 // Incremental sync fetches nothing new.
 wave = 0;
+friendWave = 0;
 assert.equal((await syncRounds()).synced, 0);
+
+// Live-scores parsing.
+const { parseLiveScores } = await import("../src/grint-client.js");
+const live = parseLiveScores(`<div id="ListliveScores"><a href="https://thegrint.com/profile/index/2000002">Sam Stokes</a> thru 7 <a href="https://thegrint.com/score/review_score/70000001">View</a></div>`);
+assert.deepEqual(live.scores, [{ id: "70000001", nine: null }]);
+assert.equal(live.profiles[0].name, "Sam Stokes");
+assert.equal(parseLiveScores(`<div id="ListliveScores"> </div>`).text, "");
 
 console.log("All offline tests passed.");
 fs.rmSync(tmp, { recursive: true, force: true });

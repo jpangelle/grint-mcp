@@ -12,7 +12,7 @@ function resultName(diff) {
 
 const count = (s, ch) => [...s].filter((c) => c === ch).length;
 
-async function courseDataFor(c, db, { courseId, tee, roundType, scoreId }) {
+export async function courseDataFor(c, db, { courseId, tee, roundType, scoreId }) {
   const key = [courseId, tee.toLowerCase()];
   const cached = db.prepare("SELECT data FROM course_tees WHERE course_id = ? AND tee = ?").get(...key);
   if (cached) return JSON.parse(cached.data);
@@ -21,7 +21,7 @@ async function courseDataFor(c, db, { courseId, tee, roundType, scoreId }) {
   return data;
 }
 
-async function syncRound(c, db, summary) {
+export async function syncRound(c, db, summary, golferId = null) {
   const card = await c.getScorecard(summary);
   const tee = card.tee || summary.tee || "";
   const course = card.courseId
@@ -66,11 +66,12 @@ async function syncRound(c, db, summary) {
   try {
     db.prepare("DELETE FROM holes WHERE round_id = ?").run(summary.id);
     db.prepare(
-      `INSERT OR REPLACE INTO rounds (id, date, course_id, course_name, tee, rating, slope, round_type, holes_played,
+      `INSERT OR REPLACE INTO rounds (id, golfer_id, date, course_id, course_name, tee, rating, slope, round_type, holes_played,
          score, par, score_to_par, putts, gir_pct, fir_pct, hdcp_diff, tournament, attested, practice, synced_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       summary.id,
+      card.ownerId || golferId,
       card.date || summary.date,
       card.courseId ?? null,
       card.courseName || summary.courseName,
@@ -107,18 +108,27 @@ async function syncRound(c, db, summary) {
   }
 }
 
+const FRIENDS_REFRESH_HOURS = 24;
+const SYNC_FRIENDS = process.env.GRINT_SYNC_FRIENDS !== "0";
+
 /**
- * Pulls rounds from TheGrint into the local SQLite cache.
+ * Pulls rounds from TheGrint into the local SQLite cache: yours first, then
+ * your friends' (Mutual Following on TheGrint) when time allows.
  * Only new or changed rounds are fetched unless fullRefresh is set.
  * Stops after `budgetMs` so an MCP tool call doesn't time out; call again to continue.
  */
 export async function syncRounds({ cache, client: c, fullRefresh = false, budgetMs = 45_000, onProgress }) {
   const started = Date.now();
   const { db } = cache;
+  const timeLeft = () => Date.now() - started < budgetMs;
 
+  if (!c.loggedIn) await c.login();
+  cache.ensureMe(c.userId);
+
+  // ---- your rounds
   const summaries = await c.listAllRounds();
   const existing = new Map(
-    db.prepare("SELECT id, score, tee, date FROM rounds").all().map((r) => [r.id, r])
+    db.prepare("SELECT id, score, tee, date FROM rounds WHERE golfer_id = ?").all(c.userId).map((r) => [r.id, r])
   );
 
   // Rounds deleted on TheGrint get removed locally too.
@@ -131,35 +141,61 @@ export async function syncRounds({ cache, client: c, fullRefresh = false, budget
     }
   }
 
-  const todo = summaries.filter((s) => {
-    if (fullRefresh) return true;
-    const e = existing.get(s.id);
-    return !e || e.score !== s.score || (s.tee && e.tee !== s.tee);
-  });
+  const changed = (s, e) => fullRefresh || !e || e.score !== s.score || (s.tee && e.tee !== s.tee);
+  const todo = summaries.filter((s) => changed(s, existing.get(s.id))).map((s) => ({ s, golferId: c.userId }));
 
   let done = 0;
   const errors = [];
-  let queue = [...todo];
-  const worker = async () => {
-    while (queue.length && Date.now() - started < budgetMs) {
-      const s = queue.shift();
-      try {
-        await syncRound(c, db, s);
-      } catch (e) {
-        if (e instanceof AuthError) throw e;
-        errors.push(`${s.date} ${s.courseName} (id ${s.id}): ${e.message}`);
+  const runQueue = async (queue, total) => {
+    const worker = async () => {
+      while (queue.length && timeLeft()) {
+        const { s, golferId } = queue.shift();
+        try {
+          await syncRound(c, db, s, golferId);
+        } catch (e) {
+          if (e instanceof AuthError) throw e;
+          errors.push(`${s.date} ${s.courseName} (id ${s.id}): ${e.message}`);
+        }
+        done++;
+        onProgress?.(done, total);
       }
-      done++;
-      onProgress?.(done, todo.length);
-    }
+    };
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   };
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  const mine = [...todo];
+  await runQueue(mine, todo.length);
+  let remaining = mine.length;
 
-  const remaining = queue.length;
+  // ---- friends
+  let friendRoundsSynced = 0;
+  if (SYNC_FRIENDS && !remaining && timeLeft()) {
+    const lastFriends = cache.getMeta("friends_synced_at");
+    if (fullRefresh || !lastFriends || Date.now() - Date.parse(lastFriends) > FRIENDS_REFRESH_HOURS * 3600_000) {
+      cache.saveGolfers(await c.listFriends());
+    }
+    const friends = db.prepare("SELECT id, name FROM golfers WHERE is_me = 0 AND updated_at IS NOT NULL").all();
+    const before = done;
+    for (const f of friends) {
+      if (!timeLeft()) {
+        remaining++;
+        continue;
+      }
+      const cached = new Map(
+        db.prepare("SELECT id, score, tee FROM rounds WHERE golfer_id = ?").all(f.id).map((r) => [r.id, r])
+      );
+      const theirs = await c.listRoundsFor(f.id, { knownIds: fullRefresh ? null : new Set(cached.keys()) });
+      const queue = theirs.filter((s) => changed(s, cached.get(s.id))).map((s) => ({ s, golferId: f.id }));
+      await runQueue(queue, queue.length);
+      remaining += queue.length;
+    }
+    friendRoundsSynced = done - before;
+  }
+
   if (!remaining) cache.setMeta("last_sync", new Date().toISOString());
   return {
     totalRoundsOnGrint: summaries.length,
     synced: done - errors.length,
+    friendRoundsSynced,
     removed,
     remaining,
     errors,

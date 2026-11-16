@@ -35,7 +35,7 @@ await client.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 const describesViews = tools.find((t) => t.name === "query_grint_data")?.description.includes("CREATE VIEW hole_details");
 console.log("query tool shows hole_details view:", describesViews);
-if (ok.isError || !bad.isError || tools.length !== 3 || !instructions.includes("golf") || !describesViews) {
+if (ok.isError || !bad.isError || tools.length !== 4 || !instructions.includes("golf") || !describesViews) {
   console.error("Smoke test FAILED");
   process.exit(1);
 }
