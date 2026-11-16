@@ -168,57 +168,76 @@ Example: "how many times have I parred hole 3 at Jimmy Clay"
   server.registerTool(
     "get_live_scores",
     {
-      title: "Today's scores, hole by hole",
+      title: "Today's round: group, handicaps and scores",
       description:
-        "Fetch scores straight from TheGrint (not the cache) for rounds dated today: yours plus any friends you name, " +
-        "and anything in TheGrint's Live Scores list. Returns each golfer's strokes per hole with par and stroke index. " +
-        "Use it during a round (for example a skins game) to pick up new holes without the user typing scores. " +
-        "Holes not yet entered are left out. If a golfer has no round dated today, they are listed in not_found.",
+        "Fetch today's rounds straight from TheGrint (not the cache): yours, any friends you name, and with group=true " +
+        "every friend with a round today at the same course as yours. Returns, for each golfer: course, tee, rating/slope/par, " +
+        "handicap index and computed course handicap, and strokes per hole with par and stroke index. Use it to set up a " +
+        "betting game (skins, Nassau) from the round the user created in TheGrint, and during the round to pick up new holes " +
+        "without the user typing scores. Holes not yet entered are left out; a round with no holes saved yet may not appear. " +
+        "Golfers named but without a round today are listed in not_found.",
       inputSchema: {
         players: z
           .array(z.string())
           .optional()
           .describe("Friends to include, by full or partial name as on TheGrint (e.g. 'Stokes', 'Eric Anderson'). You are always included."),
+        group: z
+          .boolean()
+          .optional()
+          .describe("Also find every friend playing today at the same course as you (no names needed). Slower: checks all friends."),
         date: z.string().optional().describe("YYYY-MM-DD. Defaults to today in `timezone`."),
         timezone: z.string().optional().describe("IANA time zone for 'today'. Defaults to America/Chicago."),
       },
     },
-    async ({ players = [], date, timezone = "America/Chicago" }) => {
+    async ({ players = [], group = false, date, timezone = "America/Chicago" }) => {
       try {
         const day = date ?? new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(new Date());
         const client = (ctx.client ??= ctx.createClient());
         if (!client.loggedIn) await client.login();
         const { db } = ctx.cache;
         ctx.cache.ensureMe(client.userId);
-        if (!db.prepare("SELECT 1 FROM golfers WHERE is_me = 0 LIMIT 1").get()) ctx.cache.saveGolfers(await client.listFriends());
+        // Fresh handicap indexes come from the Ranking page.
+        if (group || !db.prepare("SELECT 1 FROM golfers WHERE is_me = 0 LIMIT 1").get()) {
+          ctx.cache.saveGolfers(await client.listFriends());
+        }
 
-        const wanted = new Map([[String(client.userId), "me"]]);
+        const me = String(client.userId);
+        const wanted = new Set([me]);
         const unmatched = [];
         const ambiguous = [];
         for (const p of players) {
+          const q = p.trim().toLowerCase();
           const hits = db
             .prepare("SELECT id, name FROM golfers WHERE is_me = 0 AND name LIKE ? ORDER BY updated_at IS NULL")
             .all(`%${p.trim()}%`);
+          const exact = hits.find((h) => h.name?.toLowerCase() === q);
           if (!hits.length) unmatched.push(p);
-          else if (hits.length > 1 && !hits.some((h) => h.name.toLowerCase() === p.trim().toLowerCase()))
-            ambiguous.push({ query: p, matches: hits.map((h) => h.name) });
-          else wanted.set(hits.find((h) => h.name.toLowerCase() === p.trim().toLowerCase())?.id ?? hits[0].id, p);
+          else if (hits.length > 1 && !exact) ambiguous.push({ query: p, matches: hits.map((h) => h.name) });
+          else wanted.add(String((exact ?? hits[0]).id));
+        }
+        const named = new Set(wanted);
+        if (group) {
+          for (const { id } of db.prepare("SELECT id FROM golfers WHERE is_me = 0 AND updated_at IS NOT NULL").all()) wanted.add(String(id));
         }
 
         const live = await client.getLiveScoresList();
         const toFetch = new Map(live.scores.map((s) => [s.id, s]));
-        const notFound = [];
-        await Promise.all(
-          [...wanted.keys()].map(async (gid) => {
-            const rounds = await client.listRoundsFor(gid, { maxPages: 1 });
-            const today = rounds.filter((r) => r.date === day);
-            if (!today.length) notFound.push(gid);
-            for (const r of today) toFetch.set(r.id, r);
-          }),
-        );
+        const found = new Set();
+        const ids = [...wanted];
+        for (let i = 0; i < ids.length; i += 6) {
+          await Promise.all(
+            ids.slice(i, i + 6).map(async (gid) => {
+              const rounds = await client.listRoundsFor(gid, { maxPages: 1 });
+              for (const r of rounds.filter((r) => r.date === day)) {
+                toFetch.set(r.id, { ...r, golferId: gid });
+                found.add(gid);
+              }
+            }),
+          );
+        }
 
-        const nameOf = (id) => db.prepare("SELECT name FROM golfers WHERE id = ?").get(id)?.name ?? null;
-        const results = [];
+        const golfer = (id) => db.prepare("SELECT name, handicap FROM golfers WHERE id = ?").get(id) ?? {};
+        let results = [];
         for (const r of toFetch.values()) {
           const card = await client.getScorecard(r);
           const course = card.courseId && card.tee
@@ -227,24 +246,52 @@ Example: "how many times have I parred hole 3 at Jimmy Clay"
           const holes = card.holes
             .filter((h) => h.strokes !== null)
             .map((h) => ({ hole: h.hole, strokes: h.strokes, par: course?.par[h.hole - 1] ?? null, hcp_index: course?.hcpIndex[h.hole - 1] ?? null }));
+          const ownerId = String(card.ownerId ?? r.golferId ?? "");
+          const g = golfer(ownerId);
+          const rating = r.rating ?? course?.rating ?? null;
+          const slope = r.slope ?? course?.slope ?? null;
+          const par18 = course?.par?.length === 18 && course.par.every((p) => p !== null) ? course.par.reduce((a, b) => a + b, 0) : course?.coursePar ?? null;
+          const courseHcp =
+            g.handicap != null && rating != null && slope != null && par18 != null && card.roundType === "18"
+              ? Math.round((g.handicap * slope) / 113 + (rating - par18))
+              : null;
           results.push({
-            golfer: nameOf(card.ownerId) ?? card.ownerId,
-            golfer_id: card.ownerId,
+            golfer: g.name ?? ownerId,
+            golfer_id: ownerId,
+            is_me: ownerId === me,
             round_id: r.id,
             date: card.date,
-            course: card.courseName,
+            course: card.courseName || r.courseName || null,
+            course_id: card.courseId ?? null,
             tee: card.tee,
+            round_type: card.roundType,
+            rating,
+            slope,
+            par: par18,
+            handicap_index: g.handicap ?? null,
+            course_handicap: courseHcp,
             holes_entered: holes.length,
             last_hole: holes.at(-1)?.hole ?? null,
             holes,
+            scorecard: course ? { par: course.par, hcp_index: course.hcpIndex, yardage: course.yardage } : null,
           });
         }
+
+        // In group mode, keep only rounds at the same course as yours (plus anyone named explicitly).
+        const mine = results.find((x) => x.is_me);
+        if (group && mine?.course_id) {
+          results = results.filter((x) => x.course_id === mine.course_id || named.has(x.golfer_id));
+        }
+        // The full scorecard only needs sending once.
+        results.forEach((x, i) => i > 0 && x.course_id === results[0].course_id && delete x.scorecard);
+
         return text({
           date: day,
           rounds: results,
-          not_found: notFound.map((id) => nameOf(id) ?? id),
+          not_found: [...named].filter((id) => !found.has(id)).map((id) => golfer(id).name ?? id),
           unmatched_names: unmatched,
           ambiguous_names: ambiguous,
+          note: "course_handicap is computed from the current handicap index (index x slope / 113 + rating - par). TheGrint's own number can differ by 1.",
           live_scores_list: live.text ? live : "empty (nobody shown as live on TheGrint's dashboard)",
         });
       } catch (e) {
